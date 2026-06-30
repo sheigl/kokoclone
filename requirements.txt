@@ -1,0 +1,19 @@
+# Core Audio & AI Libraries
+# For Intel XPU (Arc) GPUs, install torch from the XPU index instead:
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/xpu
+torch
+torchaudio
+torchvision
+soundfile
+huggingface_hub
+gradio
+faiss-cpu
+librosa
+numpy<2.0.0
+pyworld
+scipy
+tqdm
+
+# Text-to-Speech (Kokoro)
+kokoro-onnx
+misaki[en,ja,zh]
