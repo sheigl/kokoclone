@@ -129,8 +129,13 @@ def convert_audio(
     print(f"[DEBUG] input audio shape={source_audio.shape}, range=[{float(source_audio.min()):.4f}, {float(source_audio.max()):.4f}], mean={float(source_audio.mean()):.4f}, std={float(source_audio.std()):.4f}")
 
     if sr != target_sr:
-        import librosa
-        source_audio = librosa.resample(source_audio, orig_sr=sr, target_sr=target_sr)
+        # Use torchaudio for resampling (replaces librosa to avoid numba/llvmlite dep)
+        import torch
+        import torchaudio
+        tensor = torch.from_numpy(source_audio).unsqueeze(0)  # [1, T]
+        source_audio = torchaudio.functional.resample(
+            tensor, orig_freq=sr, new_freq=target_sr,
+        ).squeeze().numpy()
 
     from core.rvc_assets import get_hubert_path
     hubert_path = str(get_hubert_path())
@@ -140,7 +145,7 @@ def convert_audio(
 
     f0 = _extract_f0(source_audio, target_sr, hop_length, f0_method)
     if transpose != 0:
-        f0 *= 2 ** (transpose / 12)
+        f0 = (f0 * (2 ** (transpose / 12))).astype(np.int32)
 
     print(f"[DEBUG] F0 shape={f0.shape}, nonzero={int((f0 != 0).sum())}/{len(f0)}, range=[{float(f0.min()):.0f}, {float(f0.max()):.0f}]")
 
@@ -148,10 +153,13 @@ def convert_audio(
     if index_path.exists():
         content_features = _retrieve_features(content_features, str(index_path))
 
-    # Align lengths: HuBERT and F0 may have different frame counts
-    min_len = min(len(content_features), len(f0))
-    content_features = content_features[:min_len]
-    f0 = f0[:min_len]
+    # Align lengths: resample HuBERT content features to match F0 frame rate.
+    # HuBERT runs at ~50fps, F0/mel at ~133fps — same as training pipeline.
+    if len(content_features) != len(f0):
+        c_torch = torch.FloatTensor(content_features).T.unsqueeze(0)  # [1, 768, T_c]
+        content_features = torch.nn.functional.interpolate(
+            c_torch, size=len(f0), mode="linear", align_corners=False
+        ).squeeze(0).transpose(0, 1).cpu().numpy()  # [T_m, 768]
 
     print(f"[DEBUG] after alignment: content={content_features.shape}, f0={f0.shape}")
 
@@ -186,25 +194,48 @@ def _extract_f0(
     return f0_coarse
 
 
-def _retrieve_features(content: np.ndarray, index_path: str) -> np.ndarray:
-    """Retrieve similar features from FAISS index for quality improvement."""
+def _retrieve_features(content: np.ndarray, index_path: str, k: int = 3, blend_ratio: float = 0.7) -> np.ndarray:
+    """Retrieve similar features from FAISS index for quality improvement.
+
+    Processes ALL content frames (not just the first 256) by blending
+    each frame's query feature with its k-nearest neighbors from the
+    training index.  Higher ``blend_ratio`` = more training-speaker
+    timbre; lower = more source content preservation.
+
+    Args:
+        content: Source content features [T, 768].
+        index_path: Path to FAISS index file.
+        k: Number of nearest neighbors to average (default 3).
+        blend_ratio: Weight of retrieved features (0.0 = no retrieval,
+            1.0 = fully replaced by training features, default 0.7).
+
+    Returns:
+        Blended content features with same shape as input.
+    """
     import faiss
 
     index = faiss.read_index(index_path)
     d = content.shape[1]
     query = content.reshape(-1, d).astype(np.float32)
 
-    n_search = min(256, len(query))
-    if n_search > 0:
-        _, indices = index.search(query[:n_search], 1)
-        retrieved = index.reconstruct_n(int(indices.flatten()[0]), int(n_search))
-        blend_ratio = 0.5
-        blended = query[:n_search] * (1 - blend_ratio) + retrieved * blend_ratio
-        if len(query) > n_search:
-            return np.concatenate([blended, query[n_search:]])
-        return blended
+    if len(query) == 0:
+        return content
 
-    return content
+    # Search k-nearest neighbors for every frame
+    # I shape: [T, k] — k neighbor indices for each of T query frames
+    D, I = index.search(query, k)
+    T, _ = I.shape
+
+    # Reconstruct all k neighbors for each frame and average them
+    retrieved = np.zeros_like(query)
+    for t in range(T):
+        vecs = np.array([index.reconstruct(int(I[t, j])) for j in range(k)])
+        retrieved[t] = vecs.mean(axis=0)
+
+    # Blend original with retrieved
+    blended = query * (1.0 - blend_ratio) + retrieved * blend_ratio
+
+    return blended
 
 
 def _infer(
@@ -214,51 +245,48 @@ def _infer(
     device: torch.device,
     sr: int = 40000,
 ) -> np.ndarray:
-    """Run RVC model inference: content + F0 → mel → waveform.
+    """Run RVC model inference: content + F0 → mel (+ audio).
 
-    SynthesizerTrn.infer() returns mel/cond at T_c×160 frames (upsampled by
-    the generator's internal upsample layers).  The HiFi-GAN vocoder also
-    upsamples by 160x, so we downsample the mel/cond to the correct frame
-    count (target_audio_samples / 160) before feeding to the vocoder to avoid
-    double-upsampling.
+    End-to-end mode (``net_g.use_decoder=True``, per config.json ``use_decoder:`` True):
+        The generator's embedded HiFi-GAN ``dec`` produces audio directly from
+        the predicted mel.  No external vocoder is loaded.  This is the only
+        working inference path after the G40k.pth forensic investigation (see
+        ``docs/VOCODER_INVESTIGATION.md``).
+
+    Legacy mel-only mode (``net_g.use_decoder=False``):
+        Returns ``(mel, cond)`` — mean the caller picks up an external vocoder.
+        This path is preserved for the superseded ``am_jefferson/v1.pth``
+        checkpoint but is expected to produce saturated audio.
     """
     c = torch.FloatTensor(content).unsqueeze(0).to(device)
     f0_tensor = torch.LongTensor(f0).unsqueeze(0).to(device)
 
     with torch.no_grad():
-        mel, cond = net_g.infer(c, f0=f0_tensor)  # [B, 192, T_c*160], [B, 256, T_c*160]
+        mel, secondary = net_g.infer(c, f0=f0_tensor)
 
-        print(f"[DEBUG] mel (pre-downsample) shape={mel.shape}, range=[{float(mel.min()):.4f}, {float(mel.max()):.4f}], mean={float(mel.mean()):.4f}, std={float(mel.std()):.4f}")
-        print(f"[DEBUG] cond (pre-downsample) shape={cond.shape}, range=[{float(cond.min()):.4f}, {float(cond.max()):.4f}], mean={float(cond.mean()):.4f}, std={float(cond.std()):.4f}")
+        print(f"[DEBUG] mel shape={mel.shape}, range=[{float(mel.min()):.4f}, {float(mel.max()):.4f}], "
+              f"mean={float(mel.mean()):.4f}, std={float(mel.std()):.4f}")
 
-        # Vocoder upsamples by product(upsample_rates).  For G40k.pth: [8,5,2,2] = 160.
-        vocoder = _load_vocoder(sr, device)
-        vocoder_upsample_factor = 8 * 5 * 2 * 2  # 160
+        if getattr(net_g, "use_decoder", False) and secondary is not None:
+            # ─── End-to-end path: secondary is the audio output ───
+            audio = secondary  # [B, 1, T_audio]
+            print(f"[DEBUG] end-to-end audio: shape={audio.shape}, "
+                  f"mean={float(audio.mean()):.4f}, std={float(audio.std()):.4f}, "
+                  f"sat={float((audio.abs() > 0.99).float().mean()) * 100:.1f}%")
+            wav_np = audio[0, 0].cpu().numpy()
+        else:
+            # ─── Legacy mel-only path: external G40k.pth vocoder ───
+            # NOTE: saturated output; kept only for regression testing.
+            # See docs/VOCODER_INVESTIGATION.md.
+            cond = secondary
+            print(f"[DEBUG] legacy cond shape={cond.shape}")
+            vocoder = _load_vocoder(sr, device)
+            audio = vocoder.infer(mel, cond=cond)
+            wav_np = audio[0, 0].cpu().numpy()
 
-        # Target audio length: content has T_c frames at HuBERT rate (~50fps).
-        # Audio at sr=40k for same duration = T_c * (sr / hubert_fps).
-        hubert_fps = 50
-        target_audio_samples = int(len(content) * sr / hubert_fps)
-        target_mel_frames = max(1, target_audio_samples // vocoder_upsample_factor)
-
-        print(f"[DEBUG] target_audio_samples={target_audio_samples}, target_mel_frames={target_mel_frames}")
-
-        # Downsample mel and cond from T_c*160 to target_mel_frames.
-        # interpolate works on the last dimension (T) for [B, C, T] input.
-        mel_down = torch.nn.functional.interpolate(
-            mel, size=target_mel_frames, mode="linear", align_corners=False
-        )
-        cond_down = torch.nn.functional.interpolate(
-            cond, size=target_mel_frames, mode="linear", align_corners=False
-        )
-
-        print(f"[DEBUG] mel (post-downsample) shape={mel_down.shape}")
-        print(f"[DEBUG] cond (post-downsample) shape={cond_down.shape}")
-
-        waveform = vocoder.infer(mel_down, cond=cond_down)  # [B, 1, T_audio]
-
-    wav_np = waveform[0, 0].cpu().numpy()
-    print(f"[DEBUG] waveform shape={wav_np.shape}, range=[{float(wav_np.min()):.4f}, {float(wav_np.max()):.4f}], mean={float(wav_np.mean()):.4f}, std={float(wav_np.std()):.4f}")
+    print(f"[DEBUG] final waveform: shape={wav_np.shape}, "
+          f"range=[{float(wav_np.min()):.4f}, {float(wav_np.max()):.4f}], "
+          f"mean={float(wav_np.mean()):.4f}, std={float(wav_np.std()):.4f}")
 
     return wav_np
 

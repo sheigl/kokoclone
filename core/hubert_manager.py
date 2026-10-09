@@ -54,9 +54,17 @@ class HuBERTManager:
         import numpy as np
 
         if wav_path is not None:
-            import librosa
+            # Use torchaudio for loading (replaces librosa to avoid numba/llvmlite dep)
+            import torchaudio
 
-            audio, sr = librosa.load(wav_path, sr=sr)
+            waveform, sr_loaded = torchaudio.load(wav_path)
+            if waveform.shape[0] > 1:
+                waveform = waveform.mean(dim=0, keepdim=True)  # stereo → mono
+            if sr_loaded != sr:
+                waveform = torchaudio.functional.resample(
+                    waveform, orig_freq=sr_loaded, new_freq=sr,
+                )
+            audio = waveform.squeeze().numpy()
 
         # Normalize to [-1, 1]
         if audio.dtype == np.int16 or audio.dtype == np.int32:
@@ -64,9 +72,13 @@ class HuBERTManager:
 
         # Resample to 16kHz (HuBERT expects this)
         if sr != 16000:
-            import librosa
+            # Use torchaudio for resampling (replaces librosa to avoid numba/llvmlite dep)
+            import torchaudio
 
-            audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
+            tensor = torch.from_numpy(audio).unsqueeze(0)  # [1, T]
+            audio = torchaudio.functional.resample(
+                tensor, orig_freq=sr, new_freq=16000,
+            ).squeeze().numpy()
 
         x = torch.FloatTensor(audio).to(self.device)
         while x.dim() < 2:
